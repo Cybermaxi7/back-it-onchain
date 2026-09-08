@@ -4,20 +4,21 @@ import { NextIntlClientProvider, type AbstractIntlMessages } from "next-intl";
 import React, { useState, useEffect } from "react";
 import en from "@/messages/en.json";
 import es from "@/messages/es.json";
+import de from "@/messages/de.json";
 
-const messages: Record<string, AbstractIntlMessages> = { en, es };
+const messages: Record<string, AbstractIntlMessages> = { en, es, de };
+
+/** Locales this app ships complete translations for (FE-26). */
+export const SUPPORTED_LOCALES = ["en", "es", "de"] as const;
 
 export function I18nProvider({ children }: { children: React.ReactNode }) {
   const [locale, setLocale] = useState("en");
-  const [_isLoaded, setIsLoaded] = useState(false);
 
   useEffect(() => {
     const saved = localStorage.getItem("app-locale");
-    if (saved && (saved === "en" || saved === "es")) {
+    if (saved && (SUPPORTED_LOCALES as readonly string[]).includes(saved)) {
       setLocale(saved);
     }
-    setIsLoaded(true);
-
     const handleLocaleChange = (e: CustomEvent<{ locale: string }>) => {
       setLocale(e.detail.locale);
     };

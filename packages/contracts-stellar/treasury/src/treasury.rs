@@ -1,6 +1,6 @@
 //! Treasury contract.
 //!
-//! Two responsibilities today:
+//! Three responsibilities today:
 //!
 //! * **Ownership mirror (SC-090)** — a two-step `propose_owner` / `accept_owner`
 //!   transfer that reuses `governance::ownership`, plus `sync_owner` to pull the
@@ -9,10 +9,15 @@
 //!   configuration, dividend dust and fee accrual. The authoritative `FeeConfig`
 //!   and `PlatformFees` state lives in `call_registry`; these helpers exist so
 //!   the maths can be reviewed and unit-tested independently of the host.
+//! * **Vault balance sync (SC-085)** — permissionless `sync_vault_balance`
+//!   pulls `vault_balance` from the call registry via cross-contract call and
+//!   caches it for analytics; `get_synced_vault` reads the cache.
 
 use governance::errors::ContractError;
 use governance::ownership;
-use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, token, Address, Env, Symbol, Vec,
+};
 
 // ── TTL constants (issue #169) ───────────────────────────────────────────────
 /// Approximate ledger count for 1 year (≈ 6 s per ledger, 365.25 days).
@@ -26,8 +31,18 @@ fn bump_instance_ttl(env: &Env) {
         .extend_ttl(TTL_THRESHOLD, LEDGERS_PER_YEAR);
 }
 
-// ── Owner-source interface (SC-090) ──────────────────────────────────────────
-//
+// ── Cross-contract interfaces ────────────────────────────────────────────────
+
+mod registry_iface {
+    use soroban_sdk::{contractclient, Address, Env};
+
+    #[allow(dead_code)]
+    #[contractclient(name = "RegistryClient")]
+    pub trait Registry {
+        fn credit_platform_fees(env: Env, caller: Address, amount: i128) -> i128;
+    }
+}
+
 // Any contract exposing `get_owner() -> Address` can be the authoritative owner
 // for this treasury; in practice that is `call_registry`.
 mod owner_iface {
@@ -37,6 +52,37 @@ mod owner_iface {
     #[contractclient(name = "OwnerSourceClient")]
     pub trait OwnerSource {
         fn get_owner(env: Env) -> Address;
+    }
+}
+
+// Cross-contract call registry interface (SC-085).
+mod call_registry_iface {
+    use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, String};
+
+    /// Full mirror of `call_registry::Call` — must match field-for-field so
+    /// cross-contract deserialization succeeds.
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Call {
+        pub creator: Address,
+        pub stake_token: Address,
+        pub outcome_pools: soroban_sdk::Vec<i128>,
+        pub start_ts: u64,
+        pub end_ts: u64,
+        pub token_address: Address,
+        pub pair_id: BytesN<32>,
+        pub ipfs_cid: String,
+        pub settled: bool,
+        pub winning_outcome: u32,
+        pub final_price: i128,
+        pub vault_balance: i128,
+        pub participant_count: u32,
+    }
+
+    #[allow(dead_code)]
+    #[contractclient(name = "CallRegistryClient")]
+    pub trait CallRegistry {
+        fn get_call(env: Env, call_id: u64) -> Call;
     }
 }
 
@@ -55,6 +101,39 @@ pub enum DataKey {
     OwnerSource,
     /// Legacy treasury payout address (see `set_treasury`).
     TreasuryAddress,
+    /// SAC used for liquidity deposits and fee splits (SC-082).
+    LiquidityToken,
+    /// Call registry credited with the staker dividend share (SC-084).
+    CallRegistry,
+    /// Cached vault_balance synced from the call registry (SC-085).
+    SyncedVaultBalance(u64),
+}
+
+pub(crate) fn bump_persistent_ttl(env: &Env, key: &Symbol) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD, LEDGERS_PER_YEAR);
+}
+
+pub(crate) fn treasury_payout_address(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::TreasuryAddress)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::FeeConfigNotSet))
+}
+
+pub(crate) fn get_liquidity_token_address(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::LiquidityToken)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::LiquidityTokenNotSet))
+}
+
+pub(crate) fn get_call_registry_address(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::CallRegistry)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::CallRegistryNotSet))
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -216,11 +295,157 @@ impl Treasury {
     /// Retrieve the address set via `set_treasury`.
     /// Panics with `FeeConfigNotSet` if never configured.
     pub fn get_treasury(env: Env) -> Address {
-        let addr: Option<Address> = env.storage().instance().get(&DataKey::TreasuryAddress);
-        match addr {
-            Some(a) => a,
-            None => panic_with_error!(&env, ContractError::FeeConfigNotSet),
+        treasury_payout_address(&env)
+    }
+
+    /// Configure the SAC used for liquidity and fee splits. Owner-only.
+    pub fn set_liquidity_token(env: Env, caller: Address, token: Address) {
+        caller.require_auth();
+        Self::require_owner(&env, &caller);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LiquidityToken, &token);
+        bump_instance_ttl(&env);
+
+        env.events()
+            .publish((Symbol::new(&env, "LiquidityTokenSet"),), token);
+    }
+
+    /// Read the configured liquidity token.
+    pub fn get_liquidity_token(env: Env) -> Address {
+        get_liquidity_token_address(&env)
+    }
+
+    /// Configure the call registry for dividend fee credits. Owner-only.
+    pub fn set_call_registry(env: Env, caller: Address, registry: Address) {
+        caller.require_auth();
+        Self::require_owner(&env, &caller);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CallRegistry, &registry);
+        bump_instance_ttl(&env);
+
+        env.events()
+            .publish((Symbol::new(&env, "CallRegistrySet"),), registry);
+    }
+
+    /// Read the configured call registry address.
+    pub fn get_call_registry(env: Env) -> Address {
+        get_call_registry_address(&env)
+    }
+
+    // ── Vault balance sync (SC-085) ──────────────────────────────────────────
+
+    /// Pull `vault_balance` from the call registry for `call_id` and cache it
+    /// in persistent storage for analytics.
+    ///
+    /// Permissionless — anyone may trigger a sync; the registry is the single
+    /// source of truth and the cached value is purely advisory (read-only).
+    ///
+    /// Reverts when the call registry does not contain `call_id` (propagates
+    /// the registry's `Call does not exist` panic). Reverts with
+    /// `CallRegistryNotSet` if the treasury has no registry configured.
+    ///
+    /// Emits `VaultBalanceSynced` with the new cached value.
+    pub fn sync_vault_balance(env: Env, call_id: u64) -> i128 {
+        let registry_addr = get_call_registry_address(&env);
+        let registry_client = call_registry_iface::CallRegistryClient::new(&env, &registry_addr);
+        let call = registry_client.get_call(&call_id);
+
+        let vault_balance = call.vault_balance;
+
+        let key = DataKey::SyncedVaultBalance(call_id);
+        env.storage().persistent().set(&key, &vault_balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, LEDGERS_PER_YEAR);
+
+        env.events().publish(
+            (Symbol::new(&env, "VaultBalanceSynced"), call_id),
+            vault_balance,
+        );
+
+        vault_balance
+    }
+
+    /// Read the cached vault balance for `call_id`.
+    ///
+    /// Returns `None` if `sync_vault_balance` has never been called for this
+    /// `call_id`.
+    pub fn get_synced_vault(env: Env, call_id: u64) -> Option<i128> {
+        let key = DataKey::SyncedVaultBalance(call_id);
+        env.storage().persistent().get(&key)
+    }
+
+    // ── Liquidity (SC-082 / SC-083 / SC-086) ─────────────────────────────────
+
+    /// Deposit `amount` from `from`, minting shares proportional to pool size.
+    pub fn add_liquidity(env: Env, from: Address, amount: i128) {
+        crate::liquidity::add_liquidity(&env, from, amount);
+    }
+
+    /// Burn `shares` from `to` and send pro-rata liquidity back to `to`.
+    pub fn remove_liquidity(env: Env, to: Address, shares: u128) {
+        crate::liquidity::remove_liquidity(&env, to, shares);
+    }
+
+    pub fn get_total_liquidity(env: Env) -> u128 {
+        crate::liquidity::get_total_liquidity(&env)
+    }
+
+    pub fn get_total_shares(env: Env) -> u128 {
+        crate::liquidity::get_total_shares(&env)
+    }
+
+    pub fn get_user_shares(env: Env, user: Address) -> u128 {
+        crate::liquidity::get_user_shares(&env, user)
+    }
+
+    pub fn get_liquidity_providers(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        crate::liquidity::get_liquidity_providers(&env, start, limit)
+    }
+
+    pub fn get_share_price(env: Env) -> u128 {
+        crate::liquidity::get_share_price(&env)
+    }
+
+    // ── Fee split (SC-084) ───────────────────────────────────────────────────
+
+    /// Split `amount` 70/30 between the treasury payout address and the call
+    /// registry dividend pool. Remainder from integer division goes to stakers.
+    pub fn split_fees(env: Env, caller: Address, amount: i128) {
+        caller.require_auth();
+        Self::require_owner(&env, &caller);
+
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
         }
+
+        let (treasury_share, dividend_share) = split_fee_amounts(amount).unwrap_or_else(|| {
+            panic_with_error!(&env, ContractError::ArithmeticOverflow);
+        });
+
+        let token = get_liquidity_token_address(&env);
+        let token_client = token::Client::new(&env, &token);
+        let contract = env.current_contract_address();
+
+        if treasury_share > 0 {
+            token_client.transfer(&contract, &treasury_payout_address(&env), &treasury_share);
+        }
+
+        if dividend_share > 0 {
+            let registry = get_call_registry_address(&env);
+            token_client.transfer(&contract, &registry, &dividend_share);
+            registry_iface::RegistryClient::new(&env, &registry)
+                .credit_platform_fees(&contract, &dividend_share);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "FeesSplit"),),
+            (amount, treasury_share, dividend_share),
+        );
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
@@ -283,4 +508,17 @@ pub fn accrue_fee(current: i128, fee_amount: i128) -> Option<i128> {
         return None;
     }
     current.checked_add(fee_amount)
+}
+
+/// Split `amount` 70% to treasury and 30% to stakers (SC-084).
+///
+/// Integer division truncates the treasury share; any remainder goes to the
+/// dividend pool so small amounts (e.g. 1) still credit stakers.
+pub fn split_fee_amounts(amount: i128) -> Option<(i128, i128)> {
+    if amount <= 0 {
+        return None;
+    }
+    let treasury_share = amount.checked_mul(7000)?.checked_div(10_000)?;
+    let dividend_share = amount.checked_sub(treasury_share)?;
+    Some((treasury_share, dividend_share))
 }

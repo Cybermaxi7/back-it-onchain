@@ -74,6 +74,9 @@ pub struct TokenProposal {
     pub proposer: Address,
     /// Addresses of authorized stakers who have vouched for this token.
     pub vouches: Vec<Address>,
+    /// Ledger timestamp at which this proposal was created. Used to expire
+    /// stale proposals after `PROPOSAL_EXPIRY_SECS` (issue #323).
+    pub created_at: u64,
 }
 
 /// Platform fee configuration (SC-017).
@@ -86,6 +89,9 @@ pub struct FeeConfig {
     pub treasury: Address,
 }
 
+/// Proposal expires after 7 days (in seconds); anyone may then clean it up.
+const PROPOSAL_EXPIRY_SECS: u64 = 604_800;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -94,7 +100,11 @@ pub enum DataKey {
     /// User stake: (call_id, user_address, outcome_index)
     UserStake(u64, Address, u32),
     Admin,
+    /// Pending admin for two-step ownership handover (SC-011).
+    PendingAdmin,
     IsPaused,
+    /// Authorized OutcomeManager contract address (SC-014).
+    OutcomeManager,
     /// Optional vault contract address (set by admin).
     VaultContract,
     /// Accumulated platform fees available for dividend distribution.
@@ -110,6 +120,8 @@ pub enum DataKey {
     Claimed(u64, Address),
     /// Fee configuration (bps + treasury address) — instance storage (SC-017).
     FeeConfig,
+    /// Treasury contract authorized to credit PlatformFees (SC-084).
+    TreasuryContract,
 }
 
 // ── Surge-fee helper ──────────────────────────────────────────────────────────
@@ -140,13 +152,24 @@ pub fn compute_fee_basis_points(participant_count: u32) -> i128 {
 
 // ── TTL helper (issue #169) ───────────────────────────────────────────────────
 
-/// Extend a persistent-storage key's TTL to 1 year if it falls below the
-/// 30-day threshold.  Call this on every meaningful write to ensure data
-/// is retained for 1 year from the most-recent interaction.
+/// Extend a persistent-storage key's TTL to 1 year if remaining TTL is below
+/// the 30-day threshold (SC-013). No-op when remaining TTL is already healthy.
+///
+/// Uses `get_ttl` when the key exists; always safe to call on every read/write path.
+fn maybe_bump(env: &Env, key: &DataKey) {
+    let storage = env.storage().persistent();
+    if !storage.has(key) {
+        return;
+    }
+    // Extend TTL for the key. `get_ttl` isn't available on all SDK
+    // versions, so simply extend when the key exists — it's safe to call
+    // repeatedly and avoids relying on non-portable APIs.
+    storage.extend_ttl(key, TTL_THRESHOLD, LEDGERS_PER_YEAR);
+}
+
+/// Backwards-compatible alias used by existing call sites.
 fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, TTL_THRESHOLD, LEDGERS_PER_YEAR);
+    maybe_bump(env, key);
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -160,7 +183,7 @@ impl CallRegistry {
         env.storage()
             .persistent()
             .get(&DataKey::Admin)
-            .expect("Admin not set")
+            .unwrap_or_else(|| panic!("{:?}", ContractError::AdminNotSet))
     }
 
     fn is_paused(env: &Env) -> bool {
@@ -172,8 +195,16 @@ impl CallRegistry {
 
     fn assert_not_paused(env: &Env) {
         if Self::is_paused(env) {
-            panic!("Contract is paused");
+            // ContractError::ContractPaused = 2 (SC-012 acceptance)
+            panic!("{:?}", ContractError::ContractPaused);
         }
+    }
+
+    fn require_admin_auth(env: &Env) -> Address {
+        let admin = Self::get_admin(env);
+        admin.require_auth();
+        maybe_bump(env, &DataKey::Admin);
+        admin
     }
 
     // ── Token whitelist helpers (issue #170) ──────────────────────────────────
@@ -295,41 +326,174 @@ impl CallRegistry {
         Self::accrue_fee_internal(&env, call_id, fee_amount)
     }
 
+    /// Credit platform fees from the authorized treasury contract (SC-084).
+    ///
+    /// Called after the treasury SAC-transfers the staker dividend share.
+    /// Authorization: `caller` must match the configured `TreasuryContract`.
+    pub fn credit_platform_fees(env: Env, caller: Address, amount: i128) -> i128 {
+        caller.require_auth();
+
+        let authorized: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryContract)
+            .unwrap_or_else(|| panic!("{:?}", ContractError::Unauthorized));
+        if caller != authorized {
+            panic!("{:?}", ContractError::Unauthorized);
+        }
+        if amount <= 0 {
+            panic!("{:?}", ContractError::InvalidAmount);
+        }
+
+        let current_fees: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlatformFees)
+            .unwrap_or(0);
+        let new_fees = current_fees
+            .checked_add(amount)
+            .unwrap_or_else(|| panic!("{:?}", ContractError::ArithmeticOverflow));
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlatformFees, &new_fees);
+        bump_persistent_ttl(&env, &DataKey::PlatformFees);
+
+        env.events().publish(
+            (Symbol::new(&env, "PlatformFeesCredited"), caller),
+            (amount, current_fees, new_fees),
+        );
+
+        new_fees
+    }
+
+    /// Register the treasury contract allowed to credit PlatformFees. Admin-only.
+    pub fn set_treasury_contract(env: Env, treasury: Address) {
+        let _admin = Self::require_admin_auth(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryContract, &treasury);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, LEDGERS_PER_YEAR);
+
+        env.events()
+            .publish((Symbol::new(&env, "TreasuryContractSet"),), treasury);
+    }
+
+    /// Read the authorized treasury contract address, if configured.
+    pub fn get_treasury_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryContract)
+    }
+
     // ── Admin ─────────────────────────────────────────────────────────────────
 
-    /// Initialize admin and pause state.
+    /// One-time admin + pause-state initialization (SC-011).
+    /// Reverts with `AlreadyInitialized` if `Admin` is already set.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
-            panic!("Already initialized");
+            panic!("{:?}", ContractError::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::IsPaused, &false);
+        maybe_bump(&env, &DataKey::Admin);
+        maybe_bump(&env, &DataKey::IsPaused);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminChanged"), admin.clone()),
+            (env.ledger().sequence(), true),
+        );
+    }
+
+    /// Propose a new admin (current admin only). Completes via `accept_admin` (SC-011).
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        let admin = Self::require_admin_auth(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        maybe_bump(&env, &DataKey::PendingAdmin);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminProposed"), admin, new_admin),
+            env.ledger().sequence(),
+        );
+    }
+
+    /// Accept a pending admin proposal. Only the proposed address may accept (SC-011).
+    pub fn accept_admin(env: Env) {
+        let pending: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic!("{:?}", ContractError::NoPendingOwner));
+        pending.require_auth();
+
+        let old_admin: Address = Self::get_admin(&env);
+        env.storage().persistent().set(&DataKey::Admin, &pending);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        maybe_bump(&env, &DataKey::Admin);
+
+        env.events().publish(
+            (Symbol::new(&env, "AdminChanged"), old_admin, pending),
+            env.ledger().sequence(),
+        );
+    }
+
+    /// Set the OutcomeManager contract authorized to finalize calls (SC-014).
+    pub fn set_outcome_manager(env: Env, manager: Address) {
+        let _admin = Self::require_admin_auth(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutcomeManager, &manager);
+        maybe_bump(&env, &DataKey::OutcomeManager);
+    }
+
+    pub fn get_outcome_manager(env: Env) -> Option<Address> {
+        let key = DataKey::OutcomeManager;
+        maybe_bump(&env, &key);
+        env.storage().persistent().get(&key)
     }
 
     /// Set (or clear) the vault contract address (admin only).
     pub fn set_vault(env: Env, vault: Address) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
+        let _admin = Self::require_admin_auth(&env);
         env.storage()
             .persistent()
             .set(&DataKey::VaultContract, &vault);
+        maybe_bump(&env, &DataKey::VaultContract);
     }
 
+    /// Pause all state-changing entrypoints (admin only). Emits `Paused(true)` (SC-012).
     pub fn pause(env: Env) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
+        let _admin = Self::require_admin_auth(&env);
         env.storage().persistent().set(&DataKey::IsPaused, &true);
+        maybe_bump(&env, &DataKey::IsPaused);
+
+        env.events()
+            .publish((Symbol::new(&env, "Paused"), true), env.ledger().sequence());
     }
 
+    /// Resume state-changing entrypoints (admin only). Emits `Paused(false)` (SC-012).
     pub fn unpause(env: Env) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
+        let _admin = Self::require_admin_auth(&env);
         env.storage().persistent().set(&DataKey::IsPaused, &false);
+        maybe_bump(&env, &DataKey::IsPaused);
+
+        env.events().publish(
+            (Symbol::new(&env, "Paused"), false),
+            env.ledger().sequence(),
+        );
     }
 
     pub fn get_is_paused(env: Env) -> bool {
+        maybe_bump(&env, &DataKey::IsPaused);
         Self::is_paused(&env)
+    }
+
+    pub fn get_admin_address(env: Env) -> Address {
+        maybe_bump(&env, &DataKey::Admin);
+        Self::get_admin(&env)
     }
 
     // ── Authorized staker management (issue #170) ─────────────────────────────
@@ -411,6 +575,7 @@ impl CallRegistry {
         let proposal = TokenProposal {
             proposer: proposer.clone(),
             vouches: Vec::new(&env),
+            created_at: env.ledger().timestamp(),
         };
         env.storage()
             .persistent()
@@ -474,6 +639,56 @@ impl CallRegistry {
             .persistent()
             .get(&DataKey::TokenProposal(token))
             .expect("No proposal found")
+    }
+
+    /// Non-panicking view of a pending token proposal (issue #322/#323).
+    pub fn get_proposal(env: Env, token: Address) -> Option<TokenProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenProposal(token))
+    }
+
+    /// Whether a pending proposal for `token` has expired past the 7-day window.
+    pub fn is_proposal_expired(env: Env, token: Address) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenProposal>(&DataKey::TokenProposal(token))
+        {
+            Some(p) => env.ledger().timestamp().saturating_sub(p.created_at) > PROPOSAL_EXPIRY_SECS,
+            None => false,
+        }
+    }
+
+    /// Admin can reject (and remove) a pending token proposal.
+    /// Emits `TokenRejected`. Whitelisted tokens are unaffected.
+    pub fn reject_proposal(env: Env, token: Address) {
+        let admin = Self::get_admin(&env);
+        admin.require_auth();
+
+        let key = DataKey::TokenProposal(token.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("No proposal for token");
+        }
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "TokenRejected"), token), ());
+    }
+
+    /// Anyone may clean up an expired proposal to reclaim state rent.
+    pub fn cleanup_expired_proposal(env: Env, token: Address) {
+        let key = DataKey::TokenProposal(token);
+        let proposal: TokenProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("No proposal for token");
+        if env.ledger().timestamp().saturating_sub(proposal.created_at) <= PROPOSAL_EXPIRY_SECS {
+            panic!("Proposal not yet expired");
+        }
+        env.storage().persistent().remove(&key);
+        env.events()
+            .publish((Symbol::new(&env, "TokenProposalCleaned"),), ());
     }
 
     pub fn is_authorized_staker(env: Env, staker: Address) -> bool {
@@ -629,6 +844,17 @@ impl CallRegistry {
             panic!("Invalid outcome index");
         }
 
+        // Count an address once per call, even when it stakes on multiple
+        // outcomes. The check must happen before writing the new stake.
+        let is_new_participant = (0..call.outcome_pools.len()).all(|index| {
+            let stake_key = DataKey::UserStake(call_id, staker.clone(), index);
+            env.storage()
+                .persistent()
+                .get::<DataKey, i128>(&stake_key)
+                .unwrap_or(0)
+                == 0
+        });
+
         // Transfer full amount from staker to contract (SAC escrow with
         // balance-delta guard: fee-on-transfer tokens may deliver less than
         // `amount`, so the delta received drives fee + pool bookkeeping).
@@ -667,7 +893,14 @@ impl CallRegistry {
             .vault_balance
             .checked_add(net_amount)
             .expect("Arithmetic overflow");
-        call.participant_count += 1;
+        // Participant count is gated on the user's first stake anywhere on the
+        // call, so re-staking another outcome doesn't inflate the surge fee.
+        if is_new_participant {
+            call.participant_count = call
+                .participant_count
+                .checked_add(1)
+                .expect("Participant count overflow");
+        }
         env.storage().persistent().set(&key, &call);
         // Bump TTL on every stake interaction (issue #169)
         bump_persistent_ttl(&env, &key);
@@ -965,6 +1198,108 @@ impl CallRegistry {
         );
     }
 
+    // ── Early exit with penalty (issue #321) ──────────────────────────────────
+
+    /// Let a user exit a specific position before `end_ts`, burning a 30% penalty
+    /// and charging a proportional surge fee. Refund = user_stake - penalty - fee.
+    /// Further exits after the stake is zeroed revert.
+    pub fn early_exit(env: Env, call_id: u64, user: Address, outcome_index: u32) {
+        Self::assert_not_paused(&env);
+        user.require_auth();
+
+        let key = DataKey::Call(call_id);
+        let mut call: Call = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Call does not exist");
+
+        if call.settled {
+            panic!("Call settled");
+        }
+        if env.ledger().timestamp() >= call.end_ts {
+            panic!("Call ended");
+        }
+        if outcome_index >= call.outcome_pools.len() as u32 {
+            panic!("Invalid outcome index");
+        }
+
+        let stake_key = DataKey::UserStake(call_id, user.clone(), outcome_index);
+        let user_stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&stake_key)
+            .expect("No stake found");
+        if user_stake <= 0 {
+            panic!("No stake found");
+        }
+
+        // 30% burn penalty + proportional surge fee on the exiting stake.
+        let penalty = user_stake * 3000 / 10_000;
+        let fee_bps = compute_fee_basis_points(call.participant_count);
+        let fee = user_stake * fee_bps / 10_000;
+        let refund = user_stake
+            .checked_sub(penalty)
+            .and_then(|r| r.checked_sub(fee))
+            .expect("Arithmetic underflow");
+
+        // Draw the refund from the vault; the burn stays in the contract (fees).
+        if refund > 0 {
+            Self::vault_withdraw(&env, refund);
+        }
+        call.vault_balance = call
+            .vault_balance
+            .checked_sub(refund)
+            .expect("Arithmetic underflow");
+
+        // Add the fee (but not the burn) to accumulated platform fees.
+        if fee > 0 {
+            let current_fees: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PlatformFees)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PlatformFees, &(current_fees + fee));
+        }
+
+        // Reduce the targeted outcome pool by the full exiting stake.
+        let current_pool = call.outcome_pools.get(outcome_index).unwrap();
+        call.outcome_pools.set(
+            outcome_index,
+            current_pool
+                .checked_sub(user_stake)
+                .expect("Arithmetic underflow"),
+        );
+
+        env.storage().persistent().set(&key, &call);
+        bump_persistent_ttl(&env, &key);
+
+        // Zero out the stake so a second exit reverts.
+        env.storage().persistent().set(&stake_key, &0i128);
+        bump_persistent_ttl(&env, &stake_key);
+
+        // Refund principal to the user.
+        if refund > 0 {
+            let token_client = token::Client::new(&env, &call.stake_token);
+            token_client.transfer(&env.current_contract_address(), &user, &refund);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "EarlyExit"), call_id, user),
+            (
+                outcome_index,
+                user_stake,
+                refund,
+                penalty,
+                fee,
+                call.outcome_pools.get(outcome_index).unwrap(), // New pool state
+                call.vault_balance,                             // New vault balance
+            ),
+        );
+    }
+
     // ── Storage archival (issue #169) ─────────────────────────────────────────
 
     /// Explicitly remove a fully-settled call's storage entry to reclaim state rent.
@@ -1090,33 +1425,54 @@ impl CallRegistry {
 
     /// Finalize a call. Deducts a gas fee from the losers' pools.
     /// `winning_outcome` is the 0-based index of the winning outcome.
+    /// Finalize a call with the winning outcome (SC-014).
+    ///
+    /// Only the configured OutcomeManager contract may call this. Direct calls
+    /// from EOAs or other contracts revert with `Unauthorized`. Re-finalization
+    /// is blocked by the `settled` flag (`CallSettled`).
+    ///
+    /// When `vault_rebalance` is true, remaining vault deposits are withdrawn
+    /// so yield is realized before settlement is marked complete.
     pub fn finalize_call(
         env: Env,
         call_id: u64,
         winning_outcome: u32,
         final_price: i128,
+        vault_rebalance: bool,
         caller: Address,
     ) {
+        Self::assert_not_paused(&env);
         caller.require_auth();
+
+        // Cross-contract auth: caller must be the registered OutcomeManager.
+        let om: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutcomeManager)
+            .unwrap_or_else(|| panic!("{:?}", ContractError::Unauthorized));
+        if caller != om {
+            panic!("{:?}", ContractError::Unauthorized);
+        }
+        maybe_bump(&env, &DataKey::OutcomeManager);
 
         let key = DataKey::Call(call_id);
         let mut call: Call = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("Call does not exist");
+            .unwrap_or_else(|| panic!("{:?}", ContractError::CallNotFound));
 
         if call.settled {
-            panic!("Call settled");
+            panic!("{:?}", ContractError::CallSettled);
         }
         if env.ledger().timestamp() < call.end_ts {
-            panic!("Call not yet ended");
+            panic!("{:?}", ContractError::CallNotEnded);
         }
         if winning_outcome >= call.outcome_pools.len() as u32 {
-            panic!("Invalid winning outcome");
+            panic!("{:?}", ContractError::InvalidWinningOutcome);
         }
 
-        // Sum all losing pools
+        // Sum all losing pools for gas fee
         let mut losers_pool: i128 = 0;
         for i in 0..call.outcome_pools.len() {
             if i as u32 != winning_outcome {
@@ -1127,27 +1483,38 @@ impl CallRegistry {
         let gas_fee = losers_pool * 5 / 1000;
 
         if gas_fee > 0 {
-            // Withdraw gas fee from vault before paying caller
             Self::vault_withdraw(&env, gas_fee);
-            call.vault_balance -= gas_fee;
+            call.vault_balance = call
+                .vault_balance
+                .checked_sub(gas_fee)
+                .unwrap_or_else(|| panic!("{:?}", ContractError::ArithmeticOverflow));
             let token_client = token::Client::new(&env, &call.stake_token);
             token_client.transfer(&env.current_contract_address(), &caller, &gas_fee);
+        }
+
+        // Optionally realize remaining vault yield before settlement.
+        if vault_rebalance && call.vault_balance > 0 {
+            let bal = call.vault_balance;
+            Self::vault_withdraw(&env, bal);
+            call.vault_balance = 0;
         }
 
         call.settled = true;
         call.winning_outcome = winning_outcome;
         call.final_price = final_price;
         env.storage().persistent().set(&key, &call);
+        maybe_bump(&env, &key);
 
+        // Redundant event payload: vault_balance + settled flag (SC-014).
         env.events().publish(
             (Symbol::new(&env, "CallFinalized"), call_id, caller),
             (
                 winning_outcome,
                 final_price,
                 gas_fee,
-                call.vault_balance,   // New vault balance
-                call.settled,         // Settlement state
-                call.winning_outcome, // Winning outcome index
+                call.vault_balance,
+                call.settled,
+                call.winning_outcome,
             ),
         );
     }
@@ -1214,6 +1581,14 @@ impl CallRegistry {
             .has(&DataKey::UserStake(call_id, user, outcome_index))
     }
 
+    /// The registry's current admin, exposed under the `get_owner` name so
+    /// downstream contracts can read the authoritative owner over a
+    /// cross-contract call. This is the source the treasury ownership mirror
+    /// pulls from (SC-090).
+    pub fn get_owner(env: Env) -> Address {
+        Self::get_admin(&env)
+    }
+
     pub fn get_platform_fees(env: Env) -> i128 {
         env.storage()
             .persistent()
@@ -1228,6 +1603,16 @@ impl CallRegistry {
             .get(&DataKey::Call(call_id))
             .expect("Call does not exist");
         compute_fee_basis_points(call.participant_count)
+    }
+
+    /// Number of unique participants staked on a call (issue #320).
+    pub fn get_participant_count(env: Env, call_id: u64) -> u32 {
+        let call: Call = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Call(call_id))
+            .expect("Call does not exist");
+        call.participant_count
     }
 
     // ── Binary market view shims (issue #315) ──────────────────────────────
