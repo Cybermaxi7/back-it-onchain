@@ -1575,6 +1575,12 @@ impl CallRegistry {
             .unwrap_or(0)
     }
 
+    pub fn has_stake(env: Env, call_id: u64, user: Address, outcome_index: u32) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::UserStake(call_id, user, outcome_index))
+    }
+
     /// The registry's current admin, exposed under the `get_owner` name so
     /// downstream contracts can read the authoritative owner over a
     /// cross-contract call. This is the source the treasury ownership mirror
