@@ -50,7 +50,7 @@ function getExplorerUrl(chain: "base" | "stellar", address: string): string {
   return `${config.explorer}/address/${address}`;
 }
 
-export function CallCard({ call }: CallCardProps) {
+export function CallCard({ call, onQuickStake }: CallCardProps) {
   const chain = call.chain || "base";
   const explorerUrl = getExplorerUrl(
     chain,
@@ -307,9 +307,12 @@ export function CallCard({ call }: CallCardProps) {
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  // trigger a custom event so parent can open modal if provided
-                  const ev = new CustomEvent('quick-stake', { detail: call });
-                  window.dispatchEvent(ev);
+                  if (onQuickStake) {
+                    onQuickStake(call);
+                  } else {
+                    const ev = new CustomEvent('quick-stake', { detail: call });
+                    window.dispatchEvent(ev);
+                  }
                 }}
                 className="px-3 py-1 rounded-md bg-primary text-white text-sm shadow-sm hover:brightness-95"
                 aria-label={`Quick stake on ${call.conditionJson?.title || call.title || 'this call'}`}
