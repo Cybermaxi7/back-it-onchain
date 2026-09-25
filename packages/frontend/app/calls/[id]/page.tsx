@@ -11,6 +11,7 @@ import { useState, useEffect } from "react";
 import { Loader } from "@/components/ui/Loader";
 import dynamic from "next/dynamic";
 import { dynamicSkeleton } from "@/src/lib/perf";
+import { WidgetErrorBoundary } from "@/src/components/WidgetErrorBoundary";
 const PriceChart = dynamic(() => import("@/components/PriceChart").then((m) => m.PriceChart), {
   ssr: false,
   loading: () => dynamicSkeleton({ loaderLabel: "Loading price chart...", minHeight: 300 }),
@@ -310,12 +311,20 @@ export default function CallDetailPage() {
 
             <div className="p-6">
                 <section className="mb-8">
-                    <PriceChart
-                        asset={call.asset || "Unknown"}
-                        target={call.target || "TBD"}
-                        startPrice={startPrice}
-                        targetPrice={targetPrice}
-                    />
+                    {/*
+                      Charting runs against live market data and a canvas
+                      renderer, so it is the most likely thing on this page to
+                      throw. Isolating it keeps the stake and activity controls
+                      below usable when it does.
+                    */}
+                    <WidgetErrorBoundary widget="Chart">
+                        <PriceChart
+                            asset={call.asset || "Unknown"}
+                            target={call.target || "TBD"}
+                            startPrice={startPrice}
+                            targetPrice={targetPrice}
+                        />
+                    </WidgetErrorBoundary>
                 </section>
 
                 <div className="mb-6">
