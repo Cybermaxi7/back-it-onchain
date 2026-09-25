@@ -20,7 +20,8 @@ import { MarketDetailSkeleton } from "@/components/MarketDetailSkeleton";
 import { MarketDetailRightSidebarSkeleton } from "@/components/MarketDetailRightSidebarSkeleton";
 import { PoolBar } from "@/src/components/PoolBar";
 import { ParticipantList } from "@/src/components/ParticipantList";
-import { createMockCallSocket, useCallLive } from "@/src/hooks/useCallLive";
+import { createMockCallSocket, useCallLive, poolSplit } from "@/src/hooks/useCallLive";
+import { LiveRegion } from "@/src/components/LiveRegion";
 import * as Dialog from "@radix-ui/react-dialog";
 import { toast } from "sonner";
 
@@ -76,6 +77,13 @@ export default function CallDetailPage() {
     );
 
     const live = useCallLive(id ?? '', { socketFactory });
+
+    // Quantised to whole percents: announcing every fractional socket tick
+    // would make the region chatter and drown out anything else being read.
+    const { yesPercent } = poolSplit(live.pool);
+    const poolAnnouncement = live.connected
+        ? `Live pool updated: ${Math.round(yesPercent)} percent backing`
+        : '';
 
     const stepLabels: Record<string, string> = {
         idle: "",
@@ -216,6 +224,13 @@ export default function CallDetailPage() {
                         </div>
 
                         <PoolBar pool={live.pool} />
+
+                        {/*
+                          The bar above moves silently as socket updates land.
+                          This announces the new split so screen reader users
+                          learn the pool changed without polling the page.
+                        */}
+                        <LiveRegion message={poolAnnouncement} />
 
                         <div className="flex flex-col gap-2">
                             <span className="text-sm text-muted-foreground">Participants</span>
