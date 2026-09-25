@@ -19,6 +19,7 @@ import { FollowButton } from '@/src/components/follow';
 import { useProfile } from '@/src/hooks/useProfile';
 import { useFollow } from '@/src/hooks/useFollow';
 import { AvatarUploader } from '@/src/components/AvatarUploader';
+import { SocialGraphNetwork } from '@/src/components/SocialGraphNetwork';
 
 export default function WalletProfilePage() {
   const params = useParams<{ wallet: string | string[] }>();
@@ -34,6 +35,22 @@ export default function WalletProfilePage() {
   const isSelf = Boolean(
     wallet && currentUser?.wallet && wallet.toLowerCase() === currentUser.wallet.toLowerCase(),
   );
+
+  const graph = React.useMemo(() => {
+    const people = history.slice(0, 8).map((entry) => ({
+      id: entry.id,
+      label: entry.token,
+      volume: entry.stake,
+      category: entry.category || 'Market',
+      reputation: entry.reputationDelta > 0 ? 80 : 55,
+      summary: `${entry.outcome === 'open' ? 'Active' : entry.outcome} · ${entry.stake} staked`,
+    }));
+    const root = { id: wallet ?? '', label: user?.displayName || 'Profile', volume: people.reduce((total, person) => total + person.volume, 0), category: 'Profile', reputation: user?.reputationScore ?? 0, summary: user?.bio || 'Profile activity' };
+    return {
+      nodes: [root, ...people],
+      edges: people.map((person) => ({ source: wallet ?? '', target: person.id, agreement: person.reputation >= 60 ? 'co-back' as const : 'counter-back' as const, weight: person.volume })),
+    };
+  }, [history, user, wallet]);
 
   if (!wallet) {
     return (
@@ -94,6 +111,9 @@ export default function WalletProfilePage() {
                   currentScore={user.reputationScore ?? 0}
                 />
               )}
+              <div className="mt-4">
+                <SocialGraphNetwork nodes={graph.nodes} edges={graph.edges} />
+              </div>
             </div>
           </>
         ) : null}
