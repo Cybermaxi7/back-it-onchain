@@ -12,13 +12,29 @@ import { useParams } from 'next/navigation';
 import { AppLayout } from '@/components/AppLayout';
 import { useGlobalState } from '@/components/GlobalState';
 import { useChain } from '@/components/ChainProvider';
+import dynamic from 'next/dynamic';
 import { ProfileHeader } from '@/src/components/ProfileHeader';
-import { ReputationTimeline } from '@/src/components/ReputationTimeline';
+import { dynamicSkeleton } from '@/src/lib/perf';
 import { ExportButton } from '@/src/components/ExportButton';
 import { FollowButton } from '@/src/components/follow';
 import { useProfile } from '@/src/hooks/useProfile';
 import { useFollow } from '@/src/hooks/useFollow';
 import { AvatarUploader } from '@/src/components/AvatarUploader';
+
+/**
+ * The reputation timeline pulls in `lightweight-charts`, which is only needed
+ * once this page has history to draw. Loading it on demand keeps the charting
+ * runtime out of the route's initial JavaScript payload. The skeleton reserves
+ * the chart's height so swapping it in causes no layout shift.
+ */
+const ReputationTimeline = dynamic(
+  () => import('@/src/components/ReputationTimeline').then((m) => m.ReputationTimeline),
+  {
+    ssr: false,
+    loading: () =>
+      dynamicSkeleton({ loaderLabel: 'Loading reputation timeline...', minHeight: 320 }),
+  },
+);
 
 export default function WalletProfilePage() {
   const params = useParams<{ wallet: string | string[] }>();
