@@ -20,6 +20,8 @@ import { MarketDetailSkeleton } from "@/components/MarketDetailSkeleton";
 import { MarketDetailRightSidebarSkeleton } from "@/components/MarketDetailRightSidebarSkeleton";
 import { PoolBar } from "@/src/components/PoolBar";
 import { ParticipantList } from "@/src/components/ParticipantList";
+import { CallCountdownTimeline } from "@/src/components/CallCountdownTimeline";
+import { DisputeThread } from "@/src/components/DisputeThread";
 import { createMockCallSocket, useCallLive, poolSplit } from "@/src/hooks/useCallLive";
 import { LiveRegion } from "@/src/components/LiveRegion";
 import * as Dialog from "@radix-ui/react-dialog";
@@ -373,6 +375,10 @@ export default function CallDetailPage() {
                     </div>
                 </section>
 
+                <section className="mb-8">
+                    <CallCountdownTimeline status={call.status} deadline={call.deadline || call.endTs} onExpired={() => setIsFetching(false)} />
+                </section>
+
                 {/* Action Buttons */}
                 <section className="mb-8">
                     {stakingType ? (
@@ -482,6 +488,10 @@ export default function CallDetailPage() {
                         <h3 className="text-xl font-bold">Recent Activity</h3>
                     </div>
                     <ActivityLog />
+                </section>
+
+                <section className="mb-8">
+                    <DisputeThread callId={id} />
                 </section>
 
                 <div className="flex items-center justify-between border-y border-border py-4">

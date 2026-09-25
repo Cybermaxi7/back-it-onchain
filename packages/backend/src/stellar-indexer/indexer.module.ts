@@ -7,6 +7,7 @@ import { BaseIndexerService } from './services/base-indexer.service';
 import { MultiChainIndexerService } from './services/multi-chain-indexer.service';
 import { LedgerCheckpointService } from './services/ledger-checkpoint.service';
 import { CallEventStoreService } from './services/call-event-store.service';
+import { DiagnosticParserService } from './services/diagnostic-parser.service';
 import { IndexerController } from './controllers/indexer.controller';
 
 @Module({
@@ -17,6 +18,7 @@ import { IndexerController } from './controllers/indexer.controller';
     MultiChainIndexerService,
     LedgerCheckpointService,
     CallEventStoreService,
+    DiagnosticParserService,
   ],
   controllers: [IndexerController],
   exports: [
@@ -25,6 +27,7 @@ import { IndexerController } from './controllers/indexer.controller';
     MultiChainIndexerService,
     LedgerCheckpointService,
     CallEventStoreService,
+    DiagnosticParserService,
   ],
 })
 export class IndexerModule {}

@@ -7,6 +7,7 @@ import { CallCard } from "@/components/CallCard";
 import { CallCardSkeleton } from "@/components/CallCardSkeleton";
 import { type Call, type User } from "@/lib/types";
 import { FeedPersonalize } from "@/src/components/FeedPersonalize";
+import { useFeedWorker } from "@/src/hooks/useFeedWorker";
 
 
 const API_BASE_URL = (
@@ -58,6 +59,7 @@ export default function FeedPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const processedCalls = useFeedWorker(calls, true);
 
   const fetchPage = useCallback(
     async (tab: "for-you" | "following", pageOffset: number) => {
@@ -173,7 +175,7 @@ export default function FeedPage() {
 
         {/* Feed */}
         <div className="space-y-4">
-          {calls.length === 0 && !isLoading && (
+          {processedCalls.length === 0 && !isLoading && (
             <div className="text-center py-10 text-muted-foreground">
               {activeTab === "following"
                 ? "Follow users to see their calls here."
@@ -181,7 +183,7 @@ export default function FeedPage() {
             </div>
           )}
 
-          {calls.map((call) => (
+          {processedCalls.map((call) => (
             <CallCard key={call.id} call={call} />
           ))}
 
@@ -195,7 +197,7 @@ export default function FeedPage() {
           <div ref={sentinelRef} className="h-1" />
 
           {/* End of feed */}
-          {!hasMore && calls.length > 0 && (
+          {!hasMore && processedCalls.length > 0 && (
             <p className="text-center py-6 text-sm text-muted-foreground">
               You&apos;ve reached the end of the feed.
             </p>
